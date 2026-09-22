@@ -28,8 +28,24 @@ export default function Game() {
   const [finalScore, setFinalScore] = useState(0);
   const [hitFlashOn, setHitFlashOn] = useState(false);
   const [crosshairHit, setCrosshairHit] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
 
   const stateRef = useRef(null); // mutable game state, avoids re-renders per frame
+  const joystickTouchId = useRef(null);
+  const lookTouchId = useRef(null);
+  const lookLast = useRef({ x: 0, y: 0 });
+  const fireIntervalRef = useRef(null);
+  const [knobPos, setKnobPos] = useState({ x: 0, y: 0 });
+
+  useEffect(() => {
+    setIsMobile(
+      typeof window !== "undefined" &&
+        ("ontouchstart" in window || navigator.maxTouchPoints > 0)
+    );
+    return () => {
+      if (fireIntervalRef.current) clearInterval(fireIntervalRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -169,12 +185,14 @@ export default function Game() {
         // This model's long axis (stock-to-muzzle) runs along local +Y, so
         // rotating -90° about X swings it to point along -Z (forward) —
         // the fix-up lives on gunMesh, not on gunGroup, so gunGroup stays a
-        // clean rig for positioning/recoil regardless of the asset. If a
-        // different model comes in backwards or upside down, adjust this
-        // rotation (try +Math.PI/2, or add a rotation.z of Math.PI) rather
-        // than touching gunGroup.
+        // clean rig for positioning/recoil regardless of the asset. That got
+        // the forward direction right but left it rolled 180° (magazine on
+        // top instead of underneath), so an extra Z roll corrects that. If a
+        // different model comes in backwards, adjust rotation.x instead
+        // (try +Math.PI/2) rather than touching gunGroup.
         gunMesh.scale.set(0.9, 0.9, 0.9);
         gunMesh.rotation.x = -Math.PI / 2;
+        gunMesh.rotation.z = Math.PI;
         gunMesh.updateMatrixWorld(true);
 
         const box = new THREE.Box3().setFromObject(gunMesh);
@@ -233,12 +251,61 @@ export default function Game() {
       return { mesh: buildProceduralEnemy(), mixer: null, groundY: 1 };
     }
 
+    // ---- projectile (visual tracer flying from muzzle to impact point) ----
+    const PROJECTILE_SCALE = 0.09; // asset is ~3.8 units long; this brings it to ~0.34m
+    let projectileTemplate = null;
+    tryLoadModel("/models/projectile.glb").then((gltf) => {
+      if (disposed) return;
+      if (gltf) projectileTemplate = gltf;
+    });
+
+    function spawnProjectile(originWorld, targetWorld) {
+      if (!projectileTemplate) return; // no visual asset yet — gameplay is unaffected either way
+      const obj = projectileTemplate.scene.clone(true);
+      obj.scale.setScalar(PROJECTILE_SCALE);
+      const dir = new THREE.Vector3().subVectors(targetWorld, originWorld);
+      const dist = dir.length();
+      dir.normalize();
+      // The model's fire trail streams toward local -X, so its "nose" faces
+      // local +X — align that axis with the actual flight direction.
+      obj.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir);
+      obj.position.copy(originWorld);
+      scene.add(obj);
+
+      let mixer = null;
+      if (projectileTemplate.animations && projectileTemplate.animations.length) {
+        mixer = new THREE.AnimationMixer(obj);
+        mixer.clipAction(projectileTemplate.animations[0]).play();
+      }
+
+      const travelSpeed = 55; // units/sec — fast enough to read as a bullet, not a lobbed ball
+      const duration = THREE.MathUtils.clamp(dist / travelSpeed, 0.04, 0.25);
+      S.projectiles.push({ obj, mixer, start: originWorld.clone(), end: targetWorld.clone(), t: 0, duration });
+    }
+
+    function updateProjectiles(dt) {
+      for (let i = S.projectiles.length - 1; i >= 0; i--) {
+        const p = S.projectiles[i];
+        p.t += dt;
+        const frac = Math.min(1, p.t / p.duration);
+        p.obj.position.lerpVectors(p.start, p.end, frac);
+        if (p.mixer) p.mixer.update(dt);
+        if (frac >= 1) {
+          scene.remove(p.obj);
+          S.projectiles.splice(i, 1);
+        }
+      }
+    }
+
     // ---- runtime state (kept in a ref-mirrored object to avoid re-renders per frame) ----
     const S = {
       moveState: { forward: false, back: false, left: false, right: false },
       yaw: 0, pitch: 0,
       isLocked: false,
       enemies: [],
+      projectiles: [],
+      touchMove: { x: 0, y: 0 },
+      isMobile: typeof window !== "undefined" && ("ontouchstart" in window || navigator.maxTouchPoints > 0),
       health: 100,
       ammoInMag: MAG_SIZE, ammoReserve: 36,
       score: 0,
@@ -274,24 +341,37 @@ export default function Game() {
       if (e.code === "KeyA") S.moveState.left = false;
       if (e.code === "KeyD") S.moveState.right = false;
     }
-    function onMouseMove(e) {
-      if (!S.isLocked) return;
-      const sensitivity = 0.0022;
-      S.yaw -= e.movementX * sensitivity;
-      S.pitch -= e.movementY * sensitivity;
+    function applyLook(dx, dy, sensitivity) {
+      S.yaw -= dx * sensitivity;
+      S.pitch -= dy * sensitivity;
       S.pitch = Math.max(-Math.PI / 2 + 0.05, Math.min(Math.PI / 2 - 0.05, S.pitch));
     }
+    function onMouseMove(e) {
+      if (!S.isLocked) return;
+      applyLook(e.movementX, e.movementY, 0.0022);
+    }
     function onMouseDown(e) {
+      if (S.isMobile) return; // mobile fires via the on-screen button instead
       if (!S.isLocked || S.gameOver) return;
       if (e.button === 0) shoot();
     }
     function onLockChange() {
+      if (S.isMobile) return; // touch devices never use the Pointer Lock API
       S.isLocked = document.pointerLockElement === renderer.domElement;
       if (S.isLocked) {
         if (S.gameOver) resetGame();
         setScreen("playing");
       } else if (!S.gameOver) {
         setScreen("paused");
+      }
+    }
+    function start() {
+      if (S.isMobile) {
+        if (S.gameOver) resetGame();
+        S.isLocked = true;
+        setScreen("playing");
+      } else {
+        renderer.domElement.requestPointerLock();
       }
     }
 
@@ -343,6 +423,11 @@ export default function Game() {
       raycaster.setFromCamera({ x: 0, y: 0 }, camera);
       const targets = S.enemies.map((en) => en.mesh);
       const hits = raycaster.intersectObjects(targets.concat(walls), true);
+
+      const muzzleWorld = muzzleFlash ? muzzleFlash.getWorldPosition(new THREE.Vector3()) : camera.position.clone();
+      const impactPoint = hits.length ? hits[0].point.clone() : raycaster.ray.at(40, new THREE.Vector3());
+      spawnProjectile(muzzleWorld, impactPoint);
+
       if (hits.length) {
         const hitObj = hits[0].object;
         const enemy = S.enemies.find(
@@ -479,13 +564,19 @@ export default function Game() {
       const speed = 5.2;
       const forward = new THREE.Vector3(Math.sin(S.yaw), 0, Math.cos(S.yaw)).negate();
       const right = new THREE.Vector3(forward.z, 0, -forward.x);
+
+      let inputY = (S.moveState.forward ? 1 : 0) - (S.moveState.back ? 1 : 0);
+      let inputX = (S.moveState.right ? 1 : 0) - (S.moveState.left ? 1 : 0);
+      inputY += S.touchMove.y;
+      inputX += S.touchMove.x;
+      const inputMag = Math.hypot(inputX, inputY);
+      if (inputMag > 1) { inputX /= inputMag; inputY /= inputMag; }
+
       const move = new THREE.Vector3();
-      if (S.moveState.forward) move.add(forward);
-      if (S.moveState.back) move.sub(forward);
-      if (S.moveState.right) move.add(right);
-      if (S.moveState.left) move.sub(right);
-      if (move.lengthSq() > 0) {
-        move.normalize().multiplyScalar(speed * dt);
+      move.addScaledVector(forward, inputY);
+      move.addScaledVector(right, inputX);
+      if (move.lengthSq() > 0.0001) {
+        move.multiplyScalar(speed * dt);
         const next = camera.position.clone().add(move);
         next.x = Math.max(-28, Math.min(28, next.x));
         next.z = Math.max(-28, Math.min(28, next.z));
@@ -496,7 +587,7 @@ export default function Game() {
       camera.rotation.y = S.yaw;
       camera.rotation.x = S.pitch;
 
-      const moving = S.moveState.forward || S.moveState.back || S.moveState.left || S.moveState.right;
+      const moving = Math.min(1, inputMag) > 0.05;
       if (moving) {
         S.bobPhase += dt * 9;
       } else {
@@ -518,6 +609,7 @@ export default function Game() {
       const dt = Math.min(clock.getDelta(), 0.05);
 
       updateSky(dt);
+      updateProjectiles(dt);
 
       try {
         if (S.isLocked && !S.gameOver) {
@@ -553,6 +645,11 @@ export default function Game() {
 
     // expose a way for the React UI to request pointer lock
     stateRef.current.requestLock = () => renderer.domElement.requestPointerLock();
+    stateRef.current.start = start;
+    stateRef.current.setTouchMove = (x, y) => { S.touchMove.x = x; S.touchMove.y = y; };
+    stateRef.current.applyTouchLook = (dx, dy) => applyLook(dx, dy, 0.0032);
+    stateRef.current.triggerShoot = () => { if (S.isLocked && !S.gameOver) shoot(); };
+    stateRef.current.triggerReload = () => reload();
 
     return () => {
       disposed = true;
@@ -569,7 +666,74 @@ export default function Game() {
   }, []);
 
   function handleStartClick() {
-    stateRef.current && stateRef.current.requestLock && stateRef.current.requestLock();
+    stateRef.current && stateRef.current.start && stateRef.current.start();
+  }
+
+  // ---- joystick (left thumb: movement) ----
+  const JOY_RADIUS = 52;
+  function joystickVectorFromTouch(touch, baseRect) {
+    const cx = baseRect.left + baseRect.width / 2;
+    const cy = baseRect.top + baseRect.height / 2;
+    let dx = touch.clientX - cx;
+    let dy = touch.clientY - cy;
+    const dist = Math.hypot(dx, dy);
+    if (dist > JOY_RADIUS) { dx = (dx / dist) * JOY_RADIUS; dy = (dy / dist) * JOY_RADIUS; }
+    return { dx, dy, normX: dx / JOY_RADIUS, normY: dy / JOY_RADIUS };
+  }
+  function handleJoystickStart(e) {
+    const touch = e.changedTouches[0];
+    joystickTouchId.current = touch.identifier;
+    e.currentTarget.dataset.rect = JSON.stringify(e.currentTarget.getBoundingClientRect());
+  }
+  function handleJoystickMove(e) {
+    for (const touch of e.changedTouches) {
+      if (touch.identifier !== joystickTouchId.current) continue;
+      const rect = JSON.parse(e.currentTarget.dataset.rect);
+      const { dx, dy, normX, normY } = joystickVectorFromTouch(touch, rect);
+      setKnobPos({ x: dx, y: dy });
+      // screen up (negative dy) should move forward (positive y input)
+      stateRef.current && stateRef.current.setTouchMove(normX, -normY);
+    }
+  }
+  function handleJoystickEnd(e) {
+    for (const touch of e.changedTouches) {
+      if (touch.identifier !== joystickTouchId.current) continue;
+      joystickTouchId.current = null;
+      setKnobPos({ x: 0, y: 0 });
+      stateRef.current && stateRef.current.setTouchMove(0, 0);
+    }
+  }
+
+  // ---- look zone (right side drag: aim) ----
+  function handleLookStart(e) {
+    const touch = e.changedTouches[0];
+    lookTouchId.current = touch.identifier;
+    lookLast.current = { x: touch.clientX, y: touch.clientY };
+  }
+  function handleLookMove(e) {
+    for (const touch of e.changedTouches) {
+      if (touch.identifier !== lookTouchId.current) continue;
+      const dx = touch.clientX - lookLast.current.x;
+      const dy = touch.clientY - lookLast.current.y;
+      lookLast.current = { x: touch.clientX, y: touch.clientY };
+      stateRef.current && stateRef.current.applyTouchLook(dx, dy);
+    }
+  }
+  function handleLookEnd(e) {
+    for (const touch of e.changedTouches) {
+      if (touch.identifier === lookTouchId.current) lookTouchId.current = null;
+    }
+  }
+
+  // ---- fire button (tap, or hold for full-auto) ----
+  function handleFireStart() {
+    stateRef.current && stateRef.current.triggerShoot();
+    fireIntervalRef.current = setInterval(() => {
+      stateRef.current && stateRef.current.triggerShoot();
+    }, 140);
+  }
+  function handleFireEnd() {
+    if (fireIntervalRef.current) { clearInterval(fireIntervalRef.current); fireIntervalRef.current = null; }
   }
 
   return (
@@ -582,16 +746,36 @@ export default function Game() {
         style={{ opacity: hitFlashOn ? 0.35 : 0 }}
       />
 
-      {/* crosshair */}
-      {screen === "playing" && (
+      {/* crosshair (desktop only — mobile aims via the look-drag zone without needing to fill screen center) */}
+      {screen === "playing" && !isMobile && (
         <div className="pointer-events-none fixed left-1/2 top-1/2 z-50 h-5 w-5 -translate-x-1/2 -translate-y-1/2">
           <div className={`absolute left-0 top-[9px] h-[2px] w-5 ${crosshairHit ? "bg-red-400" : "bg-white/85"}`} />
           <div className={`absolute left-[9px] top-0 h-5 w-[2px] ${crosshairHit ? "bg-red-400" : "bg-white/85"}`} />
         </div>
       )}
+      {screen === "playing" && isMobile && (
+        <div className="pointer-events-none fixed left-1/2 top-1/2 z-30 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/70" />
+      )}
 
-      {/* HUD */}
-      {screen === "playing" && (
+      {/* HUD — top placement on mobile (bottom is taken by joystick/fire controls) */}
+      {screen === "playing" && isMobile && (
+        <div className="pointer-events-none fixed inset-x-0 top-0 z-50 flex items-start justify-between p-4 text-white">          <div className="rounded-xl border border-white/20 bg-white/10 px-4 py-2 backdrop-blur-md">
+            <div className="text-xs uppercase tracking-wide opacity-75">Health</div>
+            <div className="text-xl font-bold text-green-400">{Math.round(health)}</div>
+          </div>
+          <div className="rounded-xl border border-white/20 bg-white/10 px-4 py-2 text-center backdrop-blur-md">
+            <div className="text-xs opacity-75">Score</div>
+            <div className="text-lg font-bold">{score}</div>
+          </div>
+          <div className="rounded-xl border border-white/20 bg-white/10 px-4 py-2 text-right backdrop-blur-md">
+            <div className="text-xs uppercase tracking-wide opacity-75">Ammo</div>
+            <div className="text-xl font-bold">
+              {reloading ? "..." : `${ammoInMag}/${ammoReserve}`}
+            </div>
+          </div>
+        </div>
+      )}
+      {screen === "playing" && !isMobile && (
         <div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 flex items-end justify-between p-6 text-white">
           <div className="rounded-xl bg-black/50 px-4 py-2">
             <div className="text-xs uppercase tracking-wide opacity-75">Health</div>
@@ -610,6 +794,56 @@ export default function Game() {
         </div>
       )}
 
+      {/* mobile touch controls — glassmorphism, COD-mobile style */}
+      {screen === "playing" && isMobile && (
+        <>
+          {/* look-drag zone: covers the whole screen, sits beneath the joystick/buttons */}
+          <div
+            className="fixed inset-0 z-20"
+            style={{ touchAction: "none" }}
+            onTouchStart={handleLookStart}
+            onTouchMove={handleLookMove}
+            onTouchEnd={handleLookEnd}
+            onTouchCancel={handleLookEnd}
+          />
+
+          {/* joystick */}
+          <div
+            className="fixed bottom-8 left-8 z-30 h-32 w-32 rounded-full border border-white/25 bg-white/10 shadow-lg backdrop-blur-md"
+            style={{ touchAction: "none" }}
+            onTouchStart={handleJoystickStart}
+            onTouchMove={handleJoystickMove}
+            onTouchEnd={handleJoystickEnd}
+            onTouchCancel={handleJoystickEnd}
+          >
+            <div
+              className="absolute left-1/2 top-1/2 h-14 w-14 rounded-full border border-white/40 bg-white/25 shadow-md backdrop-blur-sm"
+              style={{ transform: `translate(-50%, -50%) translate(${knobPos.x}px, ${knobPos.y}px)` }}
+            />
+          </div>
+
+          {/* fire + reload */}
+          <div className="fixed bottom-10 right-8 z-30 flex flex-col items-center gap-4">
+            <button
+              onTouchStart={handleFireStart}
+              onTouchEnd={handleFireEnd}
+              onTouchCancel={handleFireEnd}
+              className="flex h-20 w-20 items-center justify-center rounded-full border border-white/30 bg-red-500/30 text-sm font-bold text-white shadow-lg backdrop-blur-md active:scale-95 active:bg-red-500/50"
+              style={{ touchAction: "none" }}
+            >
+              FIRE
+            </button>
+            <button
+              onTouchStart={() => stateRef.current && stateRef.current.triggerReload()}
+              className="flex h-14 w-14 items-center justify-center rounded-full border border-white/25 bg-white/10 text-xs font-bold text-white shadow-md backdrop-blur-md active:scale-95 active:bg-white/20"
+              style={{ touchAction: "none" }}
+            >
+              RELOAD
+            </button>
+          </div>
+        </>
+      )}
+
       {/* center overlay */}
       {screen !== "playing" && (
         <div className="fixed left-1/2 top-1/2 z-50 w-[90%] max-w-md -translate-x-1/2 -translate-y-1/2 text-center text-white">
@@ -617,27 +851,30 @@ export default function Game() {
             <>
               <h1 className="mb-2 text-2xl font-bold">Shooter prototype</h1>
               <p className="mb-5 text-sm leading-relaxed opacity-80">
-                WASD to move, mouse to look, click to shoot, R to reload.
-                <br />
+                {isMobile ? (
+                  <>Left thumb to move, drag anywhere to look, FIRE to shoot.<br /></>
+                ) : (
+                  <>WASD to move, mouse to look, click to shoot, R to reload.<br /></>
+                )}
                 Waves of enemies will close in as day turns to night — survive as long as you can.
               </p>
               <button
                 onClick={handleStartClick}
                 className="rounded-lg bg-green-400 px-7 py-3 font-bold text-black"
               >
-                Click to start
+                {isMobile ? "Tap to start" : "Click to start"}
               </button>
             </>
           )}
           {screen === "paused" && (
             <>
               <h1 className="mb-2 text-2xl font-bold">Paused</h1>
-              <p className="mb-5 text-sm opacity-80">Click to resume.</p>
+              <p className="mb-5 text-sm opacity-80">{isMobile ? "Tap to resume." : "Click to resume."}</p>
               <button
                 onClick={handleStartClick}
                 className="rounded-lg bg-green-400 px-7 py-3 font-bold text-black"
               >
-                Click to resume
+                {isMobile ? "Tap to resume" : "Click to resume"}
               </button>
             </>
           )}
@@ -647,7 +884,7 @@ export default function Game() {
               <p className="mb-5 text-sm opacity-80">
                 Score: {finalScore}
                 <br />
-                Click to try again.
+                {isMobile ? "Tap to try again." : "Click to try again."}
               </p>
               <button
                 onClick={handleStartClick}
