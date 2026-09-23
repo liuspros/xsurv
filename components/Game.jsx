@@ -13,6 +13,18 @@ import {
   makeStarTexture,
 } from "@/lib/proceduralAssets";
 import { SoundBank } from "@/lib/sound";
+import {
+  generateCity,
+  getDistrictAt,
+  difficultyForDanger,
+  isInsideAnyFootprint,
+  makeFacadeMaterials,
+  makeRoadMaterial,
+  buildWarehouseGroup,
+  BUILDING_TEMPLATES,
+  CITY_RADIUS,
+  CELL,
+} from "@/lib/city";
 
 const MAG_SIZE = 12;
 const DAY_LENGTH = 120; // seconds per full day/night cycle
@@ -59,13 +71,13 @@ export default function Game() {
     const skyNight = new THREE.Color(0x040611);
     const skyCur = new THREE.Color();
     scene.background = skyDay.clone();
-    scene.fog = new THREE.Fog(0x2c3b2c, 18, 60);
+    scene.fog = new THREE.Fog(0x2c3b2c, 80, CITY_RADIUS * 1.6);
 
     const camera = new THREE.PerspectiveCamera(
       75,
       mount.clientWidth / mount.clientHeight,
       0.03,
-      220
+      CITY_RADIUS * 5
     );
     camera.position.set(0, 1.7, 8);
 
@@ -81,13 +93,15 @@ export default function Game() {
     const moonLight = new THREE.DirectionalLight(0x8fb3ff, 0);
     scene.add(moonLight);
 
+    const SKY_DIST = CITY_RADIUS * 3.2;
+
     // ---- sky: sun, moon, stars, clouds ----
     const sunMat = new THREE.SpriteMaterial({
       map: makeGlowTexture("rgba(255,250,220,1)", "rgba(255,200,80,0)"),
       transparent: true, blending: THREE.AdditiveBlending, fog: false, depthWrite: false,
     });
     const sunSprite = new THREE.Sprite(sunMat);
-    sunSprite.scale.set(18, 18, 18);
+    sunSprite.scale.set(SKY_DIST * 0.12, SKY_DIST * 0.12, SKY_DIST * 0.12);
     scene.add(sunSprite);
 
     const moonMat = new THREE.SpriteMaterial({
@@ -95,7 +109,7 @@ export default function Game() {
       transparent: true, blending: THREE.AdditiveBlending, fog: false, depthWrite: false,
     });
     const moonSprite = new THREE.Sprite(moonMat);
-    moonSprite.scale.set(11, 11, 11);
+    moonSprite.scale.set(SKY_DIST * 0.07, SKY_DIST * 0.07, SKY_DIST * 0.07);
     scene.add(moonSprite);
 
     const starCount = 500;
@@ -103,7 +117,7 @@ export default function Game() {
     for (let i = 0; i < starCount; i++) {
       const theta = Math.random() * Math.PI * 2;
       const phi = Math.random() * Math.PI * 0.5;
-      const r = 150;
+      const r = SKY_DIST;
       starPos[i * 3] = r * Math.cos(theta) * Math.cos(phi);
       starPos[i * 3 + 1] = r * Math.sin(phi) + 20;
       starPos[i * 3 + 2] = r * Math.sin(theta) * Math.cos(phi);
@@ -119,34 +133,94 @@ export default function Game() {
 
     const cloudTex = makeCloudTexture();
     const clouds = [];
-    for (let c = 0; c < 8; c++) {
+    const CLOUD_SPREAD = CITY_RADIUS * 1.8;
+    for (let c = 0; c < 24; c++) {
       const cm = new THREE.SpriteMaterial({ map: cloudTex, transparent: true, opacity: 0.8, depthWrite: false, fog: false });
       const sp = new THREE.Sprite(cm);
-      const scale = 18 + Math.random() * 14;
+      const scale = 50 + Math.random() * 40;
       sp.scale.set(scale * 2, scale, 1);
-      sp.position.set((Math.random() - 0.5) * 140, 26 + Math.random() * 14, (Math.random() - 0.5) * 140);
+      sp.position.set((Math.random() - 0.5) * CLOUD_SPREAD * 2, 90 + Math.random() * 40, (Math.random() - 0.5) * CLOUD_SPREAD * 2);
       scene.add(sp);
-      clouds.push({ sprite: sp, speed: 0.4 + Math.random() * 0.6 });
+      clouds.push({ sprite: sp, speed: 1.2 + Math.random() * 1.8 });
     }
 
-    // ---- floor + walls ----
-    const floorGeo = new THREE.PlaneGeometry(80, 80);
-    const floorMat = new THREE.MeshStandardMaterial({ map: makeFloorTexture(), roughness: 0.95 });
-    const floor = new THREE.Mesh(floorGeo, floorMat);
-    floor.rotation.x = -Math.PI / 2;
-    scene.add(floor);
+    // ---- city: ground, roads, instanced buildings, warehouses ----
+    const city = generateCity();
+    const walls = []; // raycast targets: buildings, warehouse walls, boundary
+    const STREET_W = 30;
 
-    const walls = [];
-    const wallMat = new THREE.MeshStandardMaterial({ color: 0x3a3a30 });
-    const wallDefs = [
-      [0, 1.5, -30, 60, 3, 1], [0, 1.5, 30, 60, 3, 1],
-      [-30, 1.5, 0, 1, 3, 60], [30, 1.5, 0, 1, 3, 60],
-      [8, 1, -4, 3, 2, 3], [-9, 1, 3, 3, 2, 3], [3, 1, 10, 2, 2, 6],
+    const groundGeo = new THREE.PlaneGeometry(CITY_RADIUS * 2.4, CITY_RADIUS * 2.4);
+    const groundMat = new THREE.MeshStandardMaterial({ map: makeFloorTexture(), roughness: 0.95 });
+    groundMat.map.repeat.set(CITY_RADIUS / 4, CITY_RADIUS / 4);
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    scene.add(ground);
+
+    // road strips: one running through each district's column and row, laid
+    // once per unique column/row so they don't double up where cells share one
+    const roadMat = makeRoadMaterial();
+    const doneCols = new Set(), doneRows = new Set();
+    city.districts.forEach((d) => {
+      if (!doneCols.has(d.col)) {
+        doneCols.add(d.col);
+        const seg = new THREE.Mesh(new THREE.PlaneGeometry(STREET_W, CITY_RADIUS * 2.4), roadMat);
+        seg.rotation.x = -Math.PI / 2;
+        seg.position.set(d.cx, 0.02, 0);
+        scene.add(seg);
+      }
+      if (!doneRows.has(d.row)) {
+        doneRows.add(d.row);
+        const seg = new THREE.Mesh(new THREE.PlaneGeometry(CITY_RADIUS * 2.4, STREET_W), roadMat);
+        seg.rotation.x = -Math.PI / 2;
+        seg.position.set(0, 0.02, d.cz);
+        scene.add(seg);
+      }
+    });
+
+    // instanced buildings: one InstancedMesh per template shape, shared
+    // across every district — draw calls stay at ~20 no matter the city size
+    const facadeMats = makeFacadeMaterials();
+    const dummyObj = new THREE.Object3D();
+    BUILDING_TEMPLATES.forEach((tmpl) => {
+      const placements = city.buildingsByTemplate[tmpl.id];
+      if (!placements.length) return;
+      const geo = new THREE.BoxGeometry(tmpl.w, tmpl.h, tmpl.d);
+      const mesh = new THREE.InstancedMesh(geo, facadeMats[tmpl.facade], placements.length);
+      placements.forEach((p, i) => {
+        dummyObj.position.set(p.x, tmpl.h / 2, p.z);
+        dummyObj.rotation.set(0, p.ry, 0);
+        dummyObj.updateMatrix();
+        mesh.setMatrixAt(i, dummyObj.matrix);
+        mesh.setColorAt(i, p.color);
+      });
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      scene.add(mesh);
+      walls.push(mesh);
+    });
+
+    // warehouses: one real (non-instanced) group per district, enterable
+    const warehouseWallMat = new THREE.MeshStandardMaterial({ color: 0x555049, roughness: 0.9 });
+    const warehousePropMat = new THREE.MeshStandardMaterial({ color: 0x6b5a3f, roughness: 0.95 });
+    city.warehouses.forEach((w) => {
+      const group = buildWarehouseGroup(THREE, warehouseWallMat, warehousePropMat);
+      group.position.set(w.x, 0, w.z);
+      group.rotation.y = w.ry;
+      scene.add(group);
+      group.traverse((child) => { if (child.isMesh) walls.push(child); });
+    });
+
+    // outer boundary so the player can't walk off the edge of the city
+    const boundaryMat = new THREE.MeshStandardMaterial({ color: 0x25281f });
+    const boundaryDefs = [
+      [0, 6, -CITY_RADIUS, CITY_RADIUS * 2 + 4, 12, 2],
+      [0, 6, CITY_RADIUS, CITY_RADIUS * 2 + 4, 12, 2],
+      [-CITY_RADIUS, 6, 0, 2, 12, CITY_RADIUS * 2 + 4],
+      [CITY_RADIUS, 6, 0, 2, 12, CITY_RADIUS * 2 + 4],
     ];
-    wallDefs.forEach((w) => {
-      const geo = new THREE.BoxGeometry(w[3], w[4], w[5]);
-      const mesh = new THREE.Mesh(geo, wallMat);
-      mesh.position.set(w[0], w[1], w[2]);
+    boundaryDefs.forEach((b) => {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(b[3], b[4], b[5]), boundaryMat);
+      mesh.position.set(b[0], b[1], b[2]);
       scene.add(mesh);
       walls.push(mesh);
     });
@@ -183,16 +257,19 @@ export default function Game() {
         usingRealGun = true;
         const gunMesh = gltf.scene;
         // This model's long axis (stock-to-muzzle) runs along local +Y, so
-        // rotating -90° about X swings it to point along -Z (forward) —
-        // the fix-up lives on gunMesh, not on gunGroup, so gunGroup stays a
-        // clean rig for positioning/recoil regardless of the asset. That got
-        // the forward direction right but left it rolled 180° (magazine on
-        // top instead of underneath), so an extra Z roll corrects that. If a
-        // different model comes in backwards, adjust rotation.x instead
-        // (try +Math.PI/2) rather than touching gunGroup.
+        // rotating -90° about X swings it to point along -Z (forward) — the
+        // fix-up lives on gunMesh, not on gunGroup, so gunGroup stays a clean
+        // rig for positioning/recoil regardless of the asset. Verified via
+        // three.js's own quaternion math (not just eyeballing a screenshot):
+        // X=-90 alone sends local +Y to world (0,0,-1) — correct forward —
+        // and local +Z (the rail/top) to world +Y (up), with the magazine
+        // end (local -Z) hanging correctly below. Do NOT add a rotation.z
+        // roll here: because three.js Euler angles compose intrinsically
+        // (XYZ order), a subsequent Z rotation does not roll around this
+        // axis's own forward direction — it rolls around a different axis
+        // entirely, and in this case flips the barrel to point backward.
         gunMesh.scale.set(0.9, 0.9, 0.9);
         gunMesh.rotation.x = -Math.PI / 2;
-        gunMesh.rotation.z = Math.PI;
         gunMesh.updateMatrixWorld(true);
 
         const box = new THREE.Box3().setFromObject(gunMesh);
@@ -494,12 +571,27 @@ export default function Game() {
     }
 
     function spawnEnemy() {
+      const district = getDistrictAt(city.districts, camera.position.x, camera.position.z);
+      const diff = difficultyForDanger(district ? district.danger : 1);
+
+      let x, z, tries = 0;
+      do {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 22 + Math.random() * 6;
+        x = camera.position.x + Math.cos(angle) * dist;
+        z = camera.position.z + Math.sin(angle) * dist;
+        tries++;
+      } while (isInsideAnyFootprint(city.footprints, x, z) && tries < 8);
+
       const { mesh, mixer, groundY } = spawnEnemyMesh();
-      const angle = Math.random() * Math.PI * 2;
-      const dist = 22 + Math.random() * 6;
-      mesh.position.set(Math.cos(angle) * dist, groundY, Math.sin(angle) * dist);
+      mesh.position.set(x, groundY, z);
       scene.add(mesh);
-      S.enemies.push({ mesh, mixer, health: 100, speed: 1.4 + Math.random() * 0.8, lastAttack: 0 });
+      S.enemies.push({
+        mesh, mixer,
+        health: 100 * diff.healthMul,
+        speed: 1.4 + Math.random() * 0.8 + diff.speedBonus,
+        lastAttack: 0,
+      });
     }
 
     function updateEnemies(dt) {
@@ -530,8 +622,8 @@ export default function Game() {
       const sunDir = new THREE.Vector3(Math.cos(theta), sunHeight, 0.35).normalize();
       const moonDir = sunDir.clone().negate();
 
-      sunSprite.position.copy(camera.position).addScaledVector(sunDir, 170);
-      moonSprite.position.copy(camera.position).addScaledVector(moonDir, 170);
+      sunSprite.position.copy(camera.position).addScaledVector(sunDir, SKY_DIST);
+      moonSprite.position.copy(camera.position).addScaledVector(moonDir, SKY_DIST);
       sunSprite.visible = sunHeight > -0.08;
       moonSprite.visible = sunHeight < 0.08;
 
@@ -555,7 +647,7 @@ export default function Game() {
 
       clouds.forEach((cl) => {
         cl.sprite.position.x += cl.speed * dt;
-        if (cl.sprite.position.x > 90) cl.sprite.position.x = -90;
+        if (cl.sprite.position.x > CLOUD_SPREAD) cl.sprite.position.x = -CLOUD_SPREAD;
         cl.sprite.material.opacity = 0.15 + dayFactor * 0.65;
       });
     }
@@ -563,7 +655,12 @@ export default function Game() {
     function updateMovement(dt) {
       const speed = 5.2;
       const forward = new THREE.Vector3(Math.sin(S.yaw), 0, Math.cos(S.yaw)).negate();
-      const right = new THREE.Vector3(forward.z, 0, -forward.x);
+      // Verified via forward × up (the mathematically correct "right"): the
+      // previous formula (forward.z, 0, -forward.x) actually computes LEFT,
+      // not right — this is forward × up done in the opposite order. This
+      // was backward since the very first version; it just took the
+      // joystick to make it obvious.
+      const right = new THREE.Vector3(-forward.z, 0, forward.x);
 
       let inputY = (S.moveState.forward ? 1 : 0) - (S.moveState.back ? 1 : 0);
       let inputX = (S.moveState.right ? 1 : 0) - (S.moveState.left ? 1 : 0);
@@ -578,8 +675,8 @@ export default function Game() {
       if (move.lengthSq() > 0.0001) {
         move.multiplyScalar(speed * dt);
         const next = camera.position.clone().add(move);
-        next.x = Math.max(-28, Math.min(28, next.x));
-        next.z = Math.max(-28, Math.min(28, next.z));
+        next.x = Math.max(-CITY_RADIUS + 4, Math.min(CITY_RADIUS - 4, next.x));
+        next.z = Math.max(-CITY_RADIUS + 4, Math.min(CITY_RADIUS - 4, next.z));
         camera.position.x = next.x;
         camera.position.z = next.z;
       }
@@ -622,7 +719,9 @@ export default function Game() {
             S.spawnInterval -= 0.15;
             S.difficultyTimer = 0;
           }
-          if (S.spawnTimer > S.spawnInterval && S.enemies.length < 12) {
+          const curDistrict = getDistrictAt(city.districts, camera.position.x, camera.position.z);
+          const effInterval = S.spawnInterval * difficultyForDanger(curDistrict ? curDistrict.danger : 1).spawnIntervalMul;
+          if (S.spawnTimer > effInterval && S.enemies.length < 12) {
             S.spawnTimer = 0;
             spawnEnemy();
           }
